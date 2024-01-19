@@ -1,35 +1,334 @@
 #!/usr/bin/env bash
+#
+# Various rendering of issue events
+#
+## markdown-list
+#
+## markdown-table
+#
+## terminal
+#
+# The following example suffers from side scrolling of EVENTS, which is not easily wrapped as-is:
+#
+# LINK                     STATE   LATEST      EVENTS
+# some-org/some-repo#1234    open  2020-01-01  asdf, sdfg, dfgh, fghj, ghjk
+# some-org/some-repo#1234  closed  2020-01-01  ...
+#
+# We need a way that issues and events can both scroll vertically:
+#
+# ISSUE: some-org/some-repo#1234
+# STATE: open
+# ASSIGNEES: @some-user, @some-other-user
+#
+# EVENT                EVENT ID  CREATED AT  ACTOR
+# added_to_project     11111111  2020-01-01  @some-user
+# added_to_project_v2  11111112  2020-01-01  @some-user
+# assigned             11111113  2020-01-01  @some-user
+# base_ref_changed     11111114  2020-01-01  @some-user
+# ...
+
 set -e
 
-echo "Hello gh-catsup!"
+CACHE_DIR=
+DATE_FORMAT="%b %d %Y"
+DEBUG=false
+EVENTS=()
+EVENTS_FILTER=""
+FORMAT="markdown-list"
+OUTPUT_PATH=
+PRESERVE=false
+SINCE=7
 
-# Snippets to help get started:
+__USAGE="
+Generate report of recent repository issue and pull request events.
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+USAGE
+  gh catsup [flags] <organization or repo> ...
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+FLAGS
+  -c, --cache-dir=</path/to/dir>      Path to directory to cache data used by extension; default creates temporary directory
+  -d, --date-format=<format>          Format of datetimes; default \`$DATE_FORMAT\`
+  -D, --debug                         Enable debugging
+  -e, --exclude-event=<events>        Event to exclude from output, can be used multiple times
+  -f, --format=<format>               Output render format; default \`$FORMAT\`
+                                        - \`markdown-list\`: simple list of issue links in GFM
+                                        - \`markdown-table\`: extensive table of information in GFM
+                                        - \`terminal\`: extensive table of information for shell usage
+  -h, --help                          Display help usage
+  -H, --hostname=<hostname>           Hostname of the GitHub instance to authenticate with
+  -i, --include-event=<events>        Event to include with output, can be used multiple times
+  -o, --output-path=</path/to/file>   Path to file to capture output; default to standard out
+  -p, --preserve                      Preserve temporary cache directory containing data
+  -s, --since=<days>                  Number of days since updated; default \`$SINCE\`
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+EVENTS
+  added_to_project
+  added_to_project_v2
+  assigned
+  base_ref_changed
+  base_ref_deleted
+  base_ref_force_pushed
+  comment_deleted
+  convert_to_draft
+  converted_from_draft
+  converted_note_to_issue
+  converted_to_discussion
+  demilestoned
+  head_ref_deleted
+  head_ref_force_pushed
+  head_ref_restored
+  issue_closed
+  issue_closed_not_planned
+  issue_reopened
+  labeled
+  locked
+  marked_as_duplicate
+  merged
+  milestoned
+  moved_columns_in_project
+  pinned
+  pr_closed
+  pr_reopened
+  project_v2_item_status_changed
+  ready_for_review
+  removed_from_project
+  removed_from_project_v2
+  renamed
+  review_request_removed
+  review_requested
+  signoff
+  signoff_canceled
+  transferred
+  unassigned
+  unlabeled
+  unlocked
+  unmarked_as_duplicate
+  unpinned
+";
+
+die() {
+	printf "\nError: %s\n" "$1"
+	echo "$__USAGE"
+	exit 1
+}
+
+if ! type -p gh > /dev/null; then
+	die "'gh' could not be found"
+fi
+
+while getopts "c:d:De:f:hH:i:o:ps:-:" OPT; do
+	if [ "$OPT" = "-" ]; then     # long option: reformulate OPT and OPTARG
+		OPT="${OPTARG%%=*}"       # extract long option name
+		OPTARG="${OPTARG#"$OPT"}" # extract long option argument (may be empty)
+		OPTARG="${OPTARG#=}"      # if long option argument, remove assigning `=`
+	fi
+
+	case "$OPT" in
+		cache-dir | c)
+			CACHE_DIR="${OPTARG}"
+			;;
+
+		date-format | d)
+			DATE_FORMAT="${OPTARG}"
+			;;
+
+		debug | D)
+			set -x
+			DEBUG=true
+			GH_DEBUG=api
+			;;
+
+		exclude-event | e)
+			if [ "$EVENTS_FILTER" == "include" ]; then
+				die "-e, --exclude-event and -i, --include-event are mutually exclusive"
+			fi
+
+			EVENTS_FILTER="exclude"
+			EVENTS+=("${OPTARG}")
+			;;
+
+		format | f)
+			export FORMAT="${OPTARG}"
+			;;
+
+		help | h)
+			echo "$__USAGE"
+			exit 0
+			;;
+
+		hostname | H)
+			export GH_HOST="${OPTARG}"
+			;;
+
+		include-event | i)
+			if [ "$EVENTS_FILTER" == "exclude" ]; then
+				die "-e, --exclude-event and -i, --include-event are mutually exclusive"
+			fi
+
+			EVENTS_FILTER="include"
+			EVENTS+=("${OPTARG}")
+			;;
+
+		output-path | o)
+			OUTPUT_PATH="${OPTARG}"
+			;;
+
+		preserve | p)
+			PRESERVE=true
+			;;
+
+		since | s)
+			export SINCE="${OPTARG}"
+			;;
+
+		*)
+			die "Unknown flag '$OPT'"
+			;;
+	esac
+done
+
+
+# shift so that $@, $1, etc. refer to the non-option arguments
+shift "$((OPTIND-1))"
+
+# TODO: Get the GitHub owner and repository name if within a git repository based on the remote origin
+if [[ "$#" -eq 0 ]]; then
+  die "Must provide one or more repository arguments"
+fi
+
+# Prepare temporary working directory for caching data
+if test -d "$CACHE_DIR"; then
+	echo "Using existing directory for caching data: $CACHE_DIR"
+elif [ -z "$CACHE_DIR" ]; then
+	CACHE_DIR="$(mktemp -d -t gh-catsupXXX)"
+	echo "Created temporary directory for caching data: $CACHE_DIR"
+
+	if ! $PRESERVE; then
+		trap 'rm -rf -- "$CACHE_DIR"' EXIT
+	fi
+else
+	mkdir -p "$CACHE_DIR"
+	echo "Created directory for caching data: $CACHE_DIR"
+fi
+
+REPORT_OUTPUT="${CACHE_DIR}/report.txt"
+REPOS=("${@}")
+
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+	SINCE_DATE="$(date -d "-${SINCE} days" "+${DATE_FORMAT}")"
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+	SINCE_DATE="$(date -j -v"-${SINCE}d" "+${DATE_FORMAT}")"
+fi
+
+printf "\n# What's up since %s\n" "$SINCE_DATE" > "$REPORT_OUTPUT"
+
+for REPO in "${REPOS[@]}"; do
+
+	if [[ ! "$REPO" == *"/"* ]]; then
+		continue
+	fi
+
+	REPO_OUTPUT="${REPO//\//-}"
+	REPO_RAW_OUTPUT="${CACHE_DIR}/${REPO_OUTPUT}-01-raw.json"
+	REPO_FILTERED_OUTPUT="${CACHE_DIR}/${REPO_OUTPUT}-02-filtered.json"
+
+	if test -f "$REPO_RAW_OUTPUT"; then
+		printf "\n%s: using raw events in %s" "$REPO" "$REPO_RAW_OUTPUT"
+	else
+		printf "\n%s: retrieving and writing raw events to %s" "$REPO" "$REPO_RAW_OUTPUT"
+		gh api "/repos/$REPO/issues/events" --paginate >> "$REPO_RAW_OUTPUT"
+	fi
+
+	# TODO: How do we handle pull requests without issues?
+	if test -f "$REPO_FILTERED_OUTPUT"; then
+		printf "\n%s: using filtered events in %s" "$REPO" "$REPO_FILTERED_OUTPUT"
+	else
+		FILTER='[
+			.[]
+			| map(. as $event | $event += { nameWithOwner: $REPO, link: ($REPO + "#" + ($event.issue.number | tostring)) })
+			| map(select(. as $event | if $EVENTS_FILTER == "exclude" then all($ARGS.positional[]; . != $event.event) elif $EVENTS_FILTER == "include" then any($ARGS.positional[]; . == $event.event) else true end))
+			| map(select(.created_at | fromdate > (now - $SINCE*24*60*60)))
+			| group_by(.link)[]
+			| {
+				link: .[0].link,
+				state: .[0].issue.state,
+				nameWithOwner: .[0].nameWithOwner,
+				latest_event_at: ([.[]] | max_by(.created_at) | .created_at | fromdate | strftime($DATE_FORMAT)),
+				assignees: ([.[].assignees.login] | unique),
+				events: [.[]] | sort_by(.created_at),
+			  }
+		]'
+
+		if $DEBUG; then
+			printf "\n%s: using jq filter\n%s" "$REPO" "$FILTER"
+		fi
+
+		printf "\n%s: retrieving and writing filtered events to %s" "$REPO" "$REPO_FILTERED_OUTPUT"
+		jq -s "$FILTER" "$REPO_RAW_OUTPUT" --arg REPO "$REPO" --arg EVENTS_FILTER "$EVENTS_FILTER" --arg DATE_FORMAT "$DATE_FORMAT" --argjson SINCE $SINCE --args "${EVENTS[@]}" > "$REPO_FILTERED_OUTPUT"
+	fi
+
+	# Calculate maximum field widths for fixed width formatting
+	PADDING_FILTER='
+		map({
+			link: (.link | length),
+			state: (.state | length),
+			latest_event_at: (.latest_event_at | length),
+		  })
+		| {
+			link: (max_by(.link) | .link),
+			state: (max_by(.state) | .state),
+			latest_event_at: (max_by(.latest_event_at) | .latest_event_at),
+		  }
+		| @base64'
+
+	PADDING_JSON=$(jq -r "$PADDING_FILTER" "$REPO_FILTERED_OUTPUT")
+
+	_padding() {
+		echo -n "${PADDING_JSON}" | base64 --decode | jq -r "${1}"
+	}
+
+	PADDING_LINK=$(_padding ".link")
+	PADDING_STATE=$(_padding ".state")
+	PADDING_AT=$(_padding ".latest_event_at")
+
+	# Begin generating output
+	printf "\n## \`%s\`\n" "$REPO" >> "$REPORT_OUTPUT"
+
+	# Handle format header as needed
+	if [[ "$FORMAT" == "terminal" ]]; then
+		FORMAT_PRINTF="\n%-${PADDING_LINK}s  %-${PADDING_STATE}s  %-${PADDING_AT}s %-s"
+		printf "$FORMAT_PRINTF" LINK STATE LATEST EVENTS >> "$REPORT_OUTPUT"
+	else
+		FORMAT_PRINTF="\n- %s" >> "$REPORT_OUTPUT"
+	fi
+
+	for ISSUE_DATA in $(jq -r 'sort_by(.latest_event_at) | .[] | @base64' "$REPO_FILTERED_OUTPUT"); do
+		_jq() {
+			echo -n "${ISSUE_DATA}" | base64 --decode | jq -r "${1}"
+		}
+
+		EVENTS_DATA="$(_jq ".events")"
+
+		if [[ "$FORMAT" == "table" ]]; then
+			printf "$FORMAT_PRINTF" "$(_jq ".link")" "$(_jq ".state")" "$(_jq ".latest_event_at")" "$(_jq '[ .events[].event ] | join(", ")')" >> "$REPORT_OUTPUT"
+		else
+			printf "$FORMAT_PRINTF" "$(_jq ".link")" >> "$REPORT_OUTPUT"
+
+			for EVENT_DATA in $(echo -n "$EVENTS_DATA" | jq -r '.[] | @base64'); do
+				_jq_event() {
+					echo -n "${EVENT_DATA}" | base64 --decode | jq -r "${1}"
+				}
+
+				printf "\n  - %s by %s" "$(_jq_event ".event")" "$(_jq_event ".actor.login")" >> "$REPORT_OUTPUT"
+			done
+		fi
+	done
+done
+
+if [ -z "$OUTPUT_PATH" ]; then
+	echo
+	cat "$REPORT_OUTPUT"
+else
+	printf "\n\nWriting report to %s\n" "$OUTPUT_PATH"
+	cat "$REPORT_OUTPUT" > "$OUTPUT_PATH"
+fi
