@@ -135,7 +135,7 @@ while getopts "c:d:De:f:hH:i:o:ps:-:" OPT; do
 		debug | D)
 			set -x
 			DEBUG=true
-			GH_DEBUG=api
+			export GH_DEBUG=api
 			;;
 
 		exclude-event | e)
